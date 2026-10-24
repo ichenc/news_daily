@@ -116,7 +116,7 @@ def render_index_html(entries):
     rows = []
     for e in entries:
         rows.append(
-            f'<tr><td><a href="./{urllib.parse.quote(e["dir"])}/index.html">{html_mod.escape(e["date_cn"])}</a></td>'
+            f'<tr><td><a href="./{urllib.parse.quote(e["path"], safe="/")}">{html_mod.escape(e["date_cn"])}</a></td>'
             f'<td style="text-align:center">{e["count"]} 条</td></tr>'
         )
     return f"""<!DOCTYPE html>
@@ -144,7 +144,7 @@ def render_readme(entries):
              "", "| 日期 | 条数 | 文字版 |", "|---|---:|---|"]
     for e in entries:
         lines.append(
-            f"| {e['date_cn']} | {e['count']} | [查看](./{urllib.parse.quote(e['dir'])}/index.html) |"
+            f"| {e['date_cn']} | {e['count']} | [查看](./{urllib.parse.quote(e['path'], safe='/')}) |"
         )
     lines += ["", "## 说明", "",
               "- 每天由 GitHub Actions 自动抓取央视网当日《新闻联播》节目单",
@@ -194,15 +194,14 @@ def main():
     if not target:
         sys.exit("[FATAL] 近 4 天都没抓到节目单")
 
-    dir_name = f"{target.year}年{target.month}月{target.day}日"
-    log(f"归档日期: {target:%Y-%m-%d}, {len(items)} 条")
+    date_cn = f"{target.year}年{target.month}月{target.day}日"
+    rel_path = f"{target.year}年/{target.month}月/{target.day:02d}.html"
+    log(f"归档日期: {target:%Y-%m-%d}, {len(items)} 条, 路径: {rel_path}")
 
-    # 当日 HTML
-    day_dir = REPO_ROOT / dir_name
-    day_dir.mkdir(parents=True, exist_ok=True)
-    (day_dir / "index.html").write_text(
-        render_day_html(target, full_link, items), encoding="utf-8"
-    )
+    # 当日 HTML: 2026年/10月/24.html
+    day_file = REPO_ROOT / rel_path
+    day_file.parent.mkdir(parents=True, exist_ok=True)
+    day_file.write_text(render_day_html(target, full_link, items), encoding="utf-8")
 
     # 读现有 README 汇总历史
     existing = {}
@@ -212,9 +211,10 @@ def main():
         for m in re.finditer(r"\|\s*(\d{4})年(\d{1,2})月(\d{1,2})日\s*\|\s*(\d+)\s*\|", old):
             y, mo, d, cnt = m.groups()
             cn = f"{y}年{int(mo)}月{int(d)}日"
-            existing[cn] = {"date_cn": cn, "dir": cn, "count": int(cnt)}
+            p = f"{y}年/{int(mo)}月/{int(d):02d}.html"
+            existing[cn] = {"date_cn": cn, "path": p, "count": int(cnt)}
 
-    existing[dir_name] = {"date_cn": dir_name, "dir": dir_name, "count": len(items)}
+    existing[date_cn] = {"date_cn": date_cn, "path": rel_path, "count": len(items)}
     entries = sorted(
         existing.values(),
         key=lambda e: (int(re.match(r"(\d+)年(\d+)月(\d+)日", e["date_cn"]).group(1)),
