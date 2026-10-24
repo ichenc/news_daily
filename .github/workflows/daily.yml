@@ -1,0 +1,38 @@
+name: 每日新闻联播文字版
+
+on:
+  schedule:
+    # UTC 12:00 = 北京时间 20:00
+    - cron: '0 12 * * *'
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: 抓取并生成 HTML
+        env:
+          FEISHU_WEBHOOK: ${{ secrets.FEISHU_WEBHOOK }}
+          GITHUB_PAGES_URL: ${{ vars.GITHUB_PAGES_URL }}
+        run: python news_daily/build.py
+
+      - name: 提交并推送
+        run: |
+          git config user.name "news-daily-bot"
+          git config user.email "news-daily-bot@users.noreply.github.com"
+          git add -A
+          if git diff --staged --quiet; then
+            echo "无更新"
+          else
+            git commit -m "auto: 新闻联播 $(date -u '+%Y-%m-%d')"
+            git push
+          fi
