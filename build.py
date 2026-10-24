@@ -21,7 +21,7 @@ import urllib.request
 from datetime import datetime, timedelta
 from pathlib import Path
 
-REPO_ROOT = Path(__file__).resolve().parent.parent
+REPO_ROOT = Path(__file__).resolve().parent
 CTX = ssl.create_default_context()
 CTX.check_hostname = False
 CTX.verify_mode = ssl.CERT_NONE
@@ -155,19 +155,18 @@ def render_readme(entries):
 
 
 # ---------- 飞书 ----------
-def send_feishu(target, items, day_page_url):
+def send_feishu(target, items):
     webhook = os.environ.get("FEISHU_WEBHOOK", "").strip()
     if not webhook:
         log("[WARN] 未设置 FEISHU_WEBHOOK, 跳过飞书推送")
         return
     cn = f"{target.year}年{target.month}月{target.day}日"
     lines = [[{"tag": "text", "text": f"📺 新闻联播 {cn} 共 {len(items)} 条\n"}]]
-    for i, it in enumerate(items[:15], 1):
-        lines.append([{"tag": "text", "text": f"{i}. {it['title']}\n"}])
-    if len(items) > 15:
-        lines.append([{"tag": "text", "text": f"… 其余 {len(items)-15} 条见归档页\n"}])
-    if day_page_url:
-        lines.append([{"tag": "a", "text": "👉 查看完整文字版归档", "href": day_page_url}])
+    for i, it in enumerate(items, 1):
+        lines.append([
+            {"tag": "text", "text": f"{i}. "},
+            {"tag": "a", "text": it["title"], "href": it["url"]},
+        ])
     payload = {"msg_type": "post",
                "content": {"post": {"zh_cn": {"title": f"新闻联播 {cn}", "content": lines}}}}
     req = urllib.request.Request(
@@ -228,10 +227,8 @@ def main():
     readme_path.write_text(render_readme(entries), encoding="utf-8")
 
     # 飞书
-    pages_base = os.environ.get("GITHUB_PAGES_URL", "").strip().rstrip("/")
-    day_url = f"{pages_base}/{urllib.parse.quote(dir_name)}/" if pages_base else ""
     try:
-        send_feishu(target, items, day_url)
+        send_feishu(target, items)
     except Exception as e:
         log(f"[WARN] 飞书失败: {e}")
 

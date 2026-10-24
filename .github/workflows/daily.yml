@@ -22,8 +22,7 @@ jobs:
       - name: 抓取并生成 HTML
         env:
           FEISHU_WEBHOOK: ${{ secrets.FEISHU_WEBHOOK }}
-          GITHUB_PAGES_URL: ${{ vars.GITHUB_PAGES_URL }}
-        run: python news_daily/build.py
+        run: python build.py
 
       - name: 提交并推送
         run: |
