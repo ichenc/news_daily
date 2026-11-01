@@ -238,11 +238,12 @@ def send_feishu(target, items, full_link):
     elements = [{"tag": "div", "text": {"tag": "lark_md", "content": "\n".join(md)}}]
     if full_link:
         elements.append({"tag": "hr"})
+        # 注意: note 元素内只允许 plain_text / lark_md / img 标签,
+        # 不能直接用 {"tag": "a"}, 否则飞书报 11246 parse card json err
         elements.append({
             "tag": "note",
             "elements": [
-                {"tag": "plain_text", "content": "完整节目视频: "},
-                {"tag": "a", "text": "央视网点播页", "href": full_link},
+                {"tag": "lark_md", "content": f"完整节目视频: [央视网点播页]({full_link})"},
             ],
         })
 
