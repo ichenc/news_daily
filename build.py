@@ -4,6 +4,9 @@
 
 """
 
+import base64
+import hashlib
+import hmac
 import html as html_mod
 import json
 import os
@@ -167,28 +170,104 @@ def render_readme(entries):
 
 # ---------- 飞书 ----------
 
-def send_feishu(target, items):
+def gen_feishu_sign(secret, timestamp):
+    """飞书自定义机器人「签名校验」算法: key = timestamp + "\\n" + secret, 空消息体."""
+    string_to_sign = f"{timestamp}\n{secret}"
+    hmac_code = hmac.new(string_to_sign.encode("utf-8"), digestmod=hashlib.sha256).digest()
+    return base64.b64encode(hmac_code).decode("utf-8")
+
+
+def post_feishu(webhook, payload, max_retry=3):
+    """发送 payload 并校验飞书业务返回码。返回 (ok, reason)。
+
+    重试策略（对齐 FXmonkey/workbuddy_auto_checkin 的做法）:
+      - 网络异常 / HTTP 5xx → 退避重试，瞬时故障自愈
+      - 飞书业务拒绝（code != 0，如 19001 地址无效、签名校验失败）→ 不重试，
+        原因带改法返回（重试无用）
+    """
+    data = json.dumps(payload).encode("utf-8")
+    attempt = 0
+    while True:
+        attempt += 1
+        try:
+            req = urllib.request.Request(
+                webhook, data=data, method="POST",
+                headers={"Content-Type": "application/json", "User-Agent": UA["User-Agent"]},
+            )
+            with urllib.request.urlopen(req, timeout=15, context=CTX) as resp:
+                body = json.loads(resp.read().decode("utf-8", "replace"))
+                code = body.get("code", body.get("StatusCode", 0))
+                if code == 0:
+                    return True, ""
+                return False, (
+                    "飞书返回码 %s：%s（19001 多为 webhook 地址不对；"
+                    "若机器人开了签名校验，请在仓库 Secret 配置 FEISHU_SECRET，"
+                    "或重建机器人时不勾选签名校验）" % (code, body.get("msg", ""))
+                )
+        except urllib.error.HTTPError as e:
+            if e.code >= 500 and attempt < max_retry:
+                log(f"  [飞书] HTTP {e.code}, 退避后重试 ({attempt}/{max_retry})")
+                time.sleep(2.0 * attempt)
+                continue
+            return False, f"HTTP {e.code}"
+        except Exception as e:
+            if attempt < max_retry:
+                log(f"  [飞书] 请求异常, 退避后重试 ({attempt}/{max_retry}): {e}")
+                time.sleep(2.0 * attempt)
+                continue
+            return False, f"{type(e).__name__}: {e}"
+
+
+def _feishu_secret():
+    secret = os.environ.get("FEISHU_SECRET", "").strip()
+    return secret or None
+
+
+def send_feishu(target, items, full_link):
+    """推送到飞书自定义机器人（interactive 卡片消息）。"""
     webhook = os.environ.get("FEISHU_WEBHOOK", "").strip()
     if not webhook:
         log("[WARN] 未设置 FEISHU_WEBHOOK, 跳过飞书推送")
         return
 
     cn = f"{target.year}年{target.month}月{target.day}日"
-    lines = [[{"tag": "text", "text": f"📺 新闻联播 {cn} 共 {len(items)} 条\n"}]]
+    md = [f"**共 {len(items)} 条**"]
     for i, it in enumerate(items, 1):
-        lines.append([
-            {"tag": "text", "text": f"{i}. "},
-            {"tag": "a", "text": it["title"], "href": it["url"]},
-        ])
-    payload = {"msg_type": "post",
-               "content": {"post": {"zh_cn": {"title": f"新闻联播 {cn}", "content": lines}}}}
-    req = urllib.request.Request(
-        webhook, data=json.dumps(payload).encode("utf-8"),
-        headers={"Content-Type": "application/json", "User-Agent": UA["User-Agent"]},
-    )
-    with urllib.request.urlopen(req, timeout=20, context=CTX) as r:
-        resp = json.loads(r.read().decode("utf-8"))
-        log(f"飞书响应: {resp}")
+        md.append(f"{i}. [{it['title']}]({it['url']})")
+
+    elements = [{"tag": "div", "text": {"tag": "lark_md", "content": "\n".join(md)}}]
+    if full_link:
+        elements.append({"tag": "hr"})
+        elements.append({
+            "tag": "note",
+            "elements": [
+                {"tag": "plain_text", "content": "完整节目视频: "},
+                {"tag": "a", "text": "央视网点播页", "href": full_link},
+            ],
+        })
+
+    payload = {
+        "msg_type": "interactive",
+        "card": {
+            "config": {"wide_screen_mode": True},
+            "header": {
+                "template": "red",
+                "title": {"tag": "plain_text", "content": f"📺 新闻联播 · {cn}"},
+            },
+            "elements": elements,
+        },
+    }
+    secret = _feishu_secret()
+    if secret:
+        ts = str(int(time.time()))
+        payload["timestamp"] = ts
+        payload["sign"] = gen_feishu_sign(secret, ts)
+
+    ok, reason = post_feishu(webhook, payload)
+    if ok:
+        log("【飞书推送】成功")
+    else:
+        log(f"【飞书推送】失败: {reason}")
 
 
 def send_feishu_error(err_msg):
@@ -196,16 +275,16 @@ def send_feishu_error(err_msg):
     webhook = os.environ.get("FEISHU_WEBHOOK", "").strip()
     if not webhook:
         return
-    try:
-        payload = {"msg_type": "text",
-                   "content": {"text": f"⚠️ 新闻联播抓取失败\n{err_msg}"}}
-        req = urllib.request.Request(
-            webhook, data=json.dumps(payload).encode("utf-8"),
-            headers={"Content-Type": "application/json", "User-Agent": UA["User-Agent"]},
-        )
-        urllib.request.urlopen(req, timeout=15, context=CTX)
-    except Exception:
-        pass
+    payload = {"msg_type": "text",
+               "content": {"text": f"⚠️ 新闻联播抓取失败\n{err_msg}"}}
+    secret = _feishu_secret()
+    if secret:
+        ts = str(int(time.time()))
+        payload["timestamp"] = ts
+        payload["sign"] = gen_feishu_sign(secret, ts)
+    ok, reason = post_feishu(webhook, payload, max_retry=2)
+    if not ok:
+        log(f"[WARN] 错误通知推送失败: {reason}")
 
 
 # ---------- 主流程 ----------
@@ -237,8 +316,14 @@ def main():
     rel_path = f"{target.year}年/{target.month}月/{target.day:02d}.html"
     log(f"归档日期: {target:%Y-%m-%d}, {len(items)} 条, 路径: {rel_path}")
 
-    # 当日 HTML
+    # 当日 HTML（幂等保护: 已归档则跳过, 避免备份时段重复生成/重复推送;
+    # 手动 workflow_dispatch 触发时 FORCE_RUN=true 可强制重跑）
     day_file = REPO_ROOT / rel_path
+    force = os.environ.get("FORCE_RUN", "").strip().lower() == "true"
+    if day_file.exists() and not force:
+        log(f"{rel_path} 已存在, 跳过重复归档与推送")
+        log("✅ 完成（幂等跳过）")
+        return
     day_file.parent.mkdir(parents=True, exist_ok=True)
     day_file.write_text(render_day_html(target, full_link, items), encoding="utf-8")
 
@@ -267,9 +352,9 @@ def main():
 
     # 飞书
     try:
-        send_feishu(target, items)
+        send_feishu(target, items, full_link)
     except Exception as e:
-        log(f"[WARN] 飞书失败: {e}")
+        log(f"【飞书推送】失败: {e}")
 
     log("✅ 完成")
 
