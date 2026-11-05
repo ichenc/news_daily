@@ -1,0 +1,14 @@
+{
+  "days": {
+    "2026-11-05": {
+      "archived": true,
+      "done": true,
+      "notified": true,
+      "note": "",
+      "count": 13,
+      "at": "2026-11-06T02:58:21.735506+08:00",
+      "delay_minutes": 428
+    }
+  },
+  "error_notified": ""
+}
