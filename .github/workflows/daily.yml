@@ -52,7 +52,8 @@ jobs:
     timeout-minutes: 20
     env:
       TZ: Asia/Shanghai
-      RESULT_FILE: ${{ runner.temp }}/news_result.log
+      # runner 上下文不能出现在 job 级 env（GitHub 会报 Unrecognized named-value: 'runner'），
+      # RESULT_FILE 改在下面各 step 的 env 里单独声明。
     steps:
       - name: 检出仓库
         uses: actions/checkout@v4
@@ -67,6 +68,7 @@ jobs:
       - name: 抓取归档并推送飞书
         id: run
         env:
+          RESULT_FILE: ${{ runner.temp }}/news_result.log
           FEISHU_WEBHOOK: ${{ secrets.FEISHU_WEBHOOK }}
           FEISHU_SECRET: ${{ secrets.FEISHU_SECRET }}   # 机器人开了签名校验才需要
           TARGET_DATE: ${{ inputs.date || github.event.client_payload.date || '' }}
@@ -114,6 +116,7 @@ jobs:
       - name: 运行报告
         if: always()
         env:
+          RESULT_FILE: ${{ runner.temp }}/news_result.log
           S_STATUS: ${{ steps.run.outputs.status }}
           S_DATE: ${{ steps.run.outputs.target_date }}
           S_COUNT: ${{ steps.run.outputs.count }}
