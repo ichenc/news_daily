@@ -1,0 +1,13 @@
+name = "news-daily-scheduler"
+main = "worker.js"
+compatibility_date = "2026-01-01"
+
+# Cloudflare Cron Triggers 按 UTC 计时：11:47 UTC = 19:47 北京时间。
+# 提前 3 分钟触发，给 workflow 留出 6 分钟轮询央视网当日页面的窗口。
+[triggers]
+crons = ["47 11 * * *"]
+
+# 需要设置的密钥（不要在文件里写明文）：
+#   npx wrangler secret put GH_TOKEN
+# 权限：classic PAT 选 repo（公开仓库 public_repo 亦可）；
+#       fine-grained PAT 对该仓库给 Contents: read & write。
