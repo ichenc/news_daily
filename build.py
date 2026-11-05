@@ -75,7 +75,7 @@ def emit(**kv):
     path = os.environ.get("GITHUB_OUTPUT", "").strip()
     if not path:
         return
-    with open(path, "a", encoding="utf-8") as f:
+    with open(path, "a", encoding="utf-8", newline="\n") as f:
         for k, v in kv.items():
             f.write(f"{k}={str(v).replace(chr(10), ' ')}\n")
 
@@ -335,13 +335,13 @@ def write_archive(target, full_link, items):
     rel_path = f"{target.year}年/{target.month}月/{target.day:02d}.html"
     day_file = REPO_ROOT / rel_path
     day_file.parent.mkdir(parents=True, exist_ok=True)
-    day_file.write_text(render_day_html(target, full_link, items), encoding="utf-8")
+    day_file.write_text(render_day_html(target, full_link, items), encoding="utf-8", newline="\n")
 
     entries = collect_entries()
     entries[cn] = {"date_cn": cn, "path": rel_path, "count": len(items)}
     ordered = sorted(entries.values(), key=sort_key, reverse=True)
-    INDEX_PATH.write_text(render_index_html(ordered), encoding="utf-8")
-    README_PATH.write_text(render_readme(ordered), encoding="utf-8")
+    INDEX_PATH.write_text(render_index_html(ordered), encoding="utf-8", newline="\n")
+    README_PATH.write_text(render_readme(ordered), encoding="utf-8", newline="\n")
     return rel_path
 
 
@@ -361,7 +361,8 @@ def load_state():
 def save_state(state):
     STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
     STATE_PATH.write_text(
-        json.dumps(state, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
+        json.dumps(state, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8", newline="\n",
     )
 
 
