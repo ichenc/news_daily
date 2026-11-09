@@ -35,6 +35,15 @@
       "count": 11,
       "at": "2026-11-09T01:14:31.903803+08:00",
       "delay_minutes": 324
+    },
+    "2026-11-09": {
+      "archived": true,
+      "done": true,
+      "notified": true,
+      "note": "",
+      "count": 12,
+      "at": "2026-11-10T05:37:46.807542+08:00",
+      "delay_minutes": 587
     }
   },
   "error_notified": ""
