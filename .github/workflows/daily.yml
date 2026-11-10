@@ -1,47 +1,19 @@
 name: 每日新闻联播文字版
 
-# 定时架构（详见 README「定时与延迟」）
-#   * 准时层：外部定时器在 11:47 UTC（19:47 北京）触发 repository_dispatch / workflow_dispatch。
-#     dispatch 不经过 GitHub 的 cron 排队，通常秒级进入队列。
-#   * 兜底层：下面 5 个 schedule cron 全部错开 :00/:30 且跨小时分布，只保证「不漏一天」，
-#     不保证准时——GitHub schedule 是尽力而为，高峰期会整批延迟数小时甚至被丢弃。
-#     原来的 11:50/11:55/12:00/12:05 四个点集中在整点窗口，实测连续两天整体延后约 7 小时，
-#     同窗口内互相兜底是无效的，故改为宽窗口错峰。
-#   * 正确性由 build.py 保证：北京时间推导目标日期 + state/delivered.json 幂等，
-#     所以无论哪一层先到、延迟多久、重复触发几次，都只归档并推送正确的一期。
 on:
-  repository_dispatch:
-    types: [daily-news]
-  workflow_dispatch:
-    inputs:
-      mode:
-        description: 'normal=正常 / rebuild=只重建归档 / repush=补发飞书'
-        required: false
-        default: 'normal'
-        type: choice
-        options: [normal, rebuild, repush]
-      date:
-        description: '手动指定归档日期 YYYY-MM-DD（留空自动推导，配合 rebuild/repush 使用）'
-        required: false
-        default: ''
-        type: string
-      dry_run:
-        description: '只抓取/渲染，不推飞书、不提交'
-        required: false
-        default: false
-        type: boolean
+  # 主定时已迁移到 Cloudflare Cron Trigger(秒级精度, 准时 19:50 北京时间触发),
+  # 由它调用下面的 workflow_dispatch。GitHub 自带的 cron 是"尽力而为"、会延迟/丢弃,
+  # 不再作为主定时(此前因此出现过 05:40 才送达 / 整天不触发的问题)。
+  # 这里仅保留一个 20:30 北京时间兜底备份: 万一 Cloudflare 当天没跑,
+  # GitHub 还能补一次; 脚本幂等, 若 Cloudflare 已跑过则自动跳过, 不会重复推送。
+  # 注意 cron 按 UTC 计时: 12:30 UTC = 20:30 北京。
   schedule:
-    # cron 按 UTC 计时，括号内为北京时间（UTC+8）
-    - cron: '47 11 * * *'   # 19:47 主窗口（错开整点高峰）
-    - cron: '17 12 * * *'   # 20:17 当日页可能刚上线
-    - cron: '43 13 * * *'   # 21:43 晚间兜底
-    - cron: '07 16 * * *'   # 次日 00:07 跨夜兜底
-    - cron: '23 23 * * *'   # 次日 07:23 次日清晨兜底
+    - cron: '30 12 * * *'   # 12:30 UTC = 20:30 北京（兜底备份, 非主定时）
+  workflow_dispatch: {}     # 手动触发：强制重新抓取并推送（绕过幂等跳过）
 
 permissions:
   contents: write
 
-# 同一时刻只跑一个，避免并发写 state/delivered.json 与互相覆盖 push
 concurrency:
   group: news-daily
   cancel-in-progress: false
@@ -49,16 +21,12 @@ concurrency:
 jobs:
   build:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
-    env:
-      TZ: Asia/Shanghai
-      # runner 上下文不能出现在 job 级 env（GitHub 会报 Unrecognized named-value: 'runner'），
-      # RESULT_FILE 改在下面各 step 的 env 里单独声明。
+    timeout-minutes: 10
     steps:
+      # 普通检出完整历史，后续只做「新增文件 + 普通 push」，
+      # 不会 force push / reset，已有归档与提交历史不受影响
       - name: 检出仓库
         uses: actions/checkout@v4
-        with:
-          fetch-depth: 0   # push 失败时可能要 rebase，需要完整历史
 
       - name: 配置 Python
         uses: actions/setup-python@v5
@@ -68,81 +36,48 @@ jobs:
       - name: 抓取归档并推送飞书
         id: run
         env:
-          RESULT_FILE: ${{ runner.temp }}/news_result.log
           FEISHU_WEBHOOK: ${{ secrets.FEISHU_WEBHOOK }}
-          FEISHU_SECRET: ${{ secrets.FEISHU_SECRET }}   # 机器人开了签名校验才需要
-          TARGET_DATE: ${{ inputs.date || github.event.client_payload.date || '' }}
-          RUN_MODE: ${{ inputs.mode || 'normal' }}
-          DRY_RUN: ${{ inputs.dry_run && 'true' || 'false' }}
-          # 准时层多等一会儿等当日页上线；兜底 cron 快速跳过，避免排队把后面的运行堵住
-          WAIT_MINUTES: ${{ github.event_name == 'schedule' && '2' || '6' }}
+          FEISHU_SECRET: ${{ secrets.FEISHU_SECRET }}   # 机器人开了签名校验才需要配
+          FORCE_RUN: ${{ github.event_name == 'workflow_dispatch' && 'true' || 'false' }}
+          RESULT_FILE: ${{ runner.temp }}/news_result.log
         run: |
-          set +e            # 自己接管退出码，避免 GitHub 默认 -e 让管道提前退出
           set -uo pipefail
+          set +e
           python build.py 2>&1 | tee "$RESULT_FILE"
           code=${PIPESTATUS[0]}
-          if [ "$code" -ne 0 ]; then
-            echo "::error::build.py 异常退出 ($code)"
-            exit "$code"
-          fi
+          set -e
+          echo "exit_code=$code" >> "$GITHUB_OUTPUT"
+          # 抓取/推送失败不让整个 job 变红，结论统一在「汇总」里展示
+          exit 0
 
-      - name: 提交并推送（只新增归档，不动已有文件）
-        if: steps.run.outputs.status == 'ok' || steps.run.outputs.status == 'rebuilt'
-        env:
-          TARGET_DATE: ${{ steps.run.outputs.target_date }}
-        run: |
-          set -euo pipefail
-          git config user.name "news-daily-bot"
-          git config user.email "news-daily-bot@users.noreply.github.com"
-          git add -A
-          if git diff --staged --quiet; then
-            echo "无更新（内容未变化）"
-            exit 0
-          fi
-          git commit -m "auto: 新闻联播 ${TARGET_DATE}"
-          # 多个触发点可能前后脚提交，push 冲突时 rebase 后重试，避免丢归档
-          for i in 1 2 3 4; do
-            if git push origin HEAD:main; then
-              echo "推送成功"
-              exit 0
-            fi
-            echo "::warning::push 第 $i 次失败，rebase 后重试"
-            git pull --rebase --autostash origin main || true
-            sleep $((i * 3))
-          done
-          echo "::error::push 连续 4 次失败，本次归档未入库（下次运行会补上）"
-          exit 1
-
-      - name: 运行报告
+      - name: 汇总
         if: always()
         env:
           RESULT_FILE: ${{ runner.temp }}/news_result.log
-          S_STATUS: ${{ steps.run.outputs.status }}
-          S_DATE: ${{ steps.run.outputs.target_date }}
-          S_COUNT: ${{ steps.run.outputs.count }}
-          S_BJ: ${{ steps.run.outputs.bj_time }}
-          S_DELAY: ${{ steps.run.outputs.delay_minutes }}
-          S_REASON: ${{ steps.run.outputs.reason }}
         run: |
           set -uo pipefail
           {
             echo "### 每日新闻联播运行报告"
             echo ""
-            echo "| 项 | 值 |"
-            echo "|---|---|"
-            echo "| 触发方式 | ${{ github.event_name }} |"
-            echo "| 运行结果 | ${S_STATUS:-未产出} |"
-            echo "| 归档日期 | ${S_DATE:-—} |"
-            echo "| 条数 | ${S_COUNT:-—} |"
-            echo "| 运行时刻（北京） | ${S_BJ:-—} |"
-            echo "| 较 19:50 延迟 | ${S_DELAY:-—} 分钟 |"
-            echo "| 备注 | ${S_REASON:-—} |"
-            echo ""
-            echo "cron 按 UTC 计时；负延迟表示提前触发。"
+            echo "- 运行时间：$(date -u '+%Y-%m-%d %H:%M UTC')（cron 为 UTC）"
+            echo "- 触发方式：${{ github.event_name }}"
           } >> "$GITHUB_STEP_SUMMARY"
           if [ -f "$RESULT_FILE" ]; then
             echo "" >> "$GITHUB_STEP_SUMMARY"
-            echo '```' >> "$GITHUB_STEP_SUMMARY"
-            grep -E "运行时刻|抓取:|抓到|归档日期|已送达|飞书推送|PENDING|FATAL|WARN|完成" "$RESULT_FILE" >> "$GITHUB_STEP_SUMMARY" || true
-            echo '```' >> "$GITHUB_STEP_SUMMARY"
+            grep -E "归档日期|飞书推送|已存在|✅|FATAL|\[WARN\]" "$RESULT_FILE" >> "$GITHUB_STEP_SUMMARY" || true
+          else
+            echo "- 未产出日志，请查看上方步骤输出" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: 提交并推送（只新增归档，不动已有文件）
+        if: steps.run.outputs.exit_code == '0'
+        run: |
+          git config user.name "news-daily-bot"
+          git config user.email "news-daily-bot@users.noreply.github.com"
+          git add -A
+          if git diff --staged --quiet; then
+            echo "无更新（当日已归档或内容未变化）"
+          else
+            git commit -m "auto: 新闻联播 $(date -u '+%Y-%m-%d')"
+            git push
           fi
