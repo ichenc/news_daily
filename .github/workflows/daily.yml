@@ -1,12 +1,13 @@
 name: 每日新闻联播文字版
 
 on:
-  # 主定时已迁移到 Cloudflare Cron Trigger(秒级精度): 每 2 分钟轮询 19:35-21:30 北京,
-  # 央视网当日节目单一上线(联播结束约 19:40 后)即在 2 分钟内触发推送 —— 做到"最快送达",
-  # 且不再死守 19:50(新闻联播偶尔会超时), 联播一结束就尽量早推。
-  # 下面 GitHub 自带 cron 仅作兜底备份(它的 cron 是"尽力而为", 会延迟/丢弃, 不作主用):
-  # 万一 Cloudflare 当天没跑, GitHub 还能多时段补; 脚本幂等, 已推送则自动跳过, 不重复发。
-  # cron 按 UTC 计时(北京=UTC+8):
+  # 主定时在 Cloudflare Cron Trigger：每 2 分钟轮询 19:00-22:00 北京，
+  # 央视网当日节目单一出现就触发本 workflow；本 workflow 内部会「等联播播完」
+  # 再推送（build.py 的 wait_for_complete：整期视频上线 + 条目稳定 90s），
+  # 所以联播超时到 19:50 也不会推出半截稿（2026-11-12 漏稿事故的修复点）。
+  # 下面 GitHub 自带 cron 仅作兜底（它的 cron 是"尽力而为"，会延迟/丢弃，不作主用）：
+  # 脚本幂等，已推送且条目未增加则自动跳过，不重复发。
+  # cron 按 UTC 计时（北京=UTC+8）：
   schedule:
     - cron: '40 11 * * *'   # 19:40 北京 兜底
     - cron: '10 12 * * *'   # 20:10 北京 兜底
@@ -32,7 +33,9 @@ concurrency:
 jobs:
   build:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    # build.py 需要轮询等待「联播播完」（最长到 20:20 北京），
+    # 所以这里必须留足时间，10 分钟会被中途杀掉。
+    timeout-minutes: 90
     steps:
       # 普通检出完整历史，后续只做「新增文件 + 普通 push」，
       # 不会 force push / reset，已有归档与提交历史不受影响
@@ -76,7 +79,7 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
           if [ -f "$RESULT_FILE" ]; then
             echo "" >> "$GITHUB_STEP_SUMMARY"
-            grep -E "归档日期|飞书推送|已存在|✅|FATAL|\[WARN\]" "$RESULT_FILE" >> "$GITHUB_STEP_SUMMARY" || true
+            grep -E "归档日期|完整性|补全|飞书推送|已存在|已归档|✅|FATAL|\[WARN\]" "$RESULT_FILE" >> "$GITHUB_STEP_SUMMARY" || true
           else
             echo "- 未产出日志，请查看上方步骤输出" >> "$GITHUB_STEP_SUMMARY"
           fi
