@@ -16,7 +16,7 @@ import sys
 import time
 import urllib.parse
 import urllib.request
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent
@@ -28,8 +28,25 @@ CTX.verify_mode = ssl.CERT_NONE
 UA = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"}
 
 
+def beijing_now():
+    """GitHub runner 跑在 UTC，统一换算成北京时间（无夏令时，固定 +8）。
+
+    用北京时间定「今天」非常重要：否则 00:00-08:00（北京）之间的运行会把日期算成前一天。
+    """
+    return datetime.now(timezone.utc).replace(tzinfo=None) + timedelta(hours=8)
+
+
 def log(*a):
-    print(f"[{datetime.now().strftime('%H:%M:%S')}]", *a, flush=True)
+    print(f"[{beijing_now().strftime('%H:%M:%S')} 北京]", *a, flush=True)
+
+
+def _hhmm(value, default):
+    """解析 "HH:MM" 形式的配置，失败时用默认值。"""
+    try:
+        h, m = str(value).split(":")
+        return int(h), int(m)
+    except Exception:
+        return default
 
 
 def http_get(url, timeout=25, retries=3):
@@ -85,8 +102,89 @@ def fetch_xwlb_items(target: datetime):
             if t:
                 items.append({"title": t, "url": href})
 
-    log(f"  抓到 {len(items)} 条")
+    log(f"  抓到 {len(items)} 条（整期视频链接: {'有' if full_link else '无'}）")
     return full_link, items
+
+
+# ---------- 完整性判定（核心：等联播真的播完再推） ----------
+#
+# 背景：央视网当日节目单是「边播边传」——整期视频和每条新闻的切片是陆续上线的。
+# 2026-11-12 就是 19:30 抓到 6 条（联播还没播完）就推了，之后央视网又上了
+# 「晋谒衣冠冢仪式」「联播快讯」2 条，导致推送漏稿。
+#
+# 判定「已经齐了」的三重条件（全部满足才推）：
+#   1) 整期视频链接已出现 —— 《新闻联播》YYYYMMDD 19:00，央视网在**整期播完**
+#      之后才发布这条，是最可靠的「节目已结束」信号；
+#   2) 当前时间 >= 19:36 —— 兜住「整期链接提前挂出」的极端情况；
+#   3) 条目连续 90 秒没有变化 —— 兜住「切片还在陆续上传」。
+# 兜底：到 20:20（北京）无论如何都推当前已有条目，宁可晚/少，不能不发。
+
+MIN_READY = os.environ.get("MIN_READY", "19:36")        # 早于此时间绝不判定齐全
+HARD_DEADLINE = os.environ.get("HARD_DEADLINE", "20:20")  # 兜底截止时间（北京）
+STABLE_SECONDS = int(os.environ.get("STABLE_SECONDS", "90"))   # 条目需稳定多久
+POLL_SECONDS = int(os.environ.get("POLL_SECONDS", "60"))       # 轮询间隔
+MAX_WAIT_MINUTES = int(os.environ.get("MAX_WAIT_MINUTES", "75"))
+
+
+def wait_for_complete(target):
+    """轮询当日节目单，直到「整期视频已上线 + 条目稳定」。
+
+    返回 (full_link, items, reason, complete)：
+      complete=True  → 正常齐全，可以放心推送；
+      complete=False → 到兜底时间按现有条目推送（或完全没有条目）。
+    """
+    mh, mm = _hhmm(MIN_READY, (19, 36))
+    dh, dm = _hhmm(HARD_DEADLINE, (20, 20))
+    now = beijing_now()
+    min_ready = now.replace(hour=mh, minute=mm, second=0, microsecond=0)
+    hard = now.replace(hour=dh, minute=dm, second=0, microsecond=0)
+    give_up = min(hard, now + timedelta(minutes=MAX_WAIT_MINUTES))
+
+    log(f"等待节目单齐全（整期视频上线 + 条目稳定 {STABLE_SECONDS}s），"
+        f"兜底截止 {give_up:%H:%M}")
+
+    last_sig, stable_since = None, None
+    full_link, items = None, []
+    while True:
+        try:
+            full_link, items = fetch_xwlb_items(target)
+        except Exception as e:
+            log(f"  抓取异常: {e}")
+            items = []
+
+        now = beijing_now()
+        if items:
+            sig = tuple(it["title"] for it in items)
+            if sig != last_sig:
+                last_sig, stable_since = sig, now
+                log(f"  当前 {len(items)} 条（整期视频: {'有' if full_link else '无'}），重新计时")
+            stable = (now - stable_since).total_seconds()
+
+            if full_link and now >= min_ready and stable >= STABLE_SECONDS:
+                return (full_link, items,
+                        f"联播已播完：整期视频已上线，{len(items)} 条已稳定 {int(stable)}s",
+                        True)
+
+        if now >= give_up:
+            if not items:
+                return None, [], "兜底时间到，仍无可解析条目", False
+            return (full_link, items,
+                    f"兜底时间 {give_up:%H:%M} 到，按现有 {len(items)} 条推送"
+                    f"（整期视频: {'有' if full_link else '无'}）",
+                    False)
+
+        time.sleep(POLL_SECONDS)
+
+
+def read_archived_count(path):
+    """读已归档 HTML 里的「共 N 条」。不存在返回 None，存在但解析不出返回 -1。"""
+    try:
+        if not path.exists():
+            return None
+        m = re.search(r"共\s*(\d+)\s*条", path.read_text(encoding="utf-8"))
+        return int(m.group(1)) if m else -1
+    except Exception:
+        return None
 
 
 # ---------- 渲染 ----------
@@ -223,8 +321,8 @@ def _feishu_secret():
     return secret or None
 
 
-def send_feishu(target, items, full_link):
-    """推送到飞书自定义机器人（interactive 卡片消息）。"""
+def send_feishu(target, items, full_link, tag=""):
+    """推送到飞书自定义机器人（interactive 卡片消息）。tag 用于标题后缀，如「（补全版）」。"""
     webhook = os.environ.get("FEISHU_WEBHOOK", "").strip()
     if not webhook:
         log("[WARN] 未设置 FEISHU_WEBHOOK, 跳过飞书推送")
@@ -253,7 +351,7 @@ def send_feishu(target, items, full_link):
             "config": {"wide_screen_mode": True},
             "header": {
                 "template": "red",
-                "title": {"tag": "plain_text", "content": f"📺 新闻联播 · {cn}"},
+                "title": {"tag": "plain_text", "content": f"📺 新闻联播 · {cn}{tag}"},
             },
             "elements": elements,
         },
@@ -291,37 +389,47 @@ def send_feishu_error(err_msg):
 # ---------- 主流程 ----------
 
 def main():
-    # 只盯「今天」：新闻联播当天 19:00 播出、约 19:40 后央视网当日页面才上线。
-    # 配合高频定时（Cloudflare 每 2 分钟轮询 19:35-21:30 北京）即可做到
-    # 「联播一结束、页面一上线，就在 2 分钟内推送」，且绝不会误推往期内容。
-    # 当天页面还没好（items 为空）→ 直接结束，等下一轮定时再来；
-    # 不归档、不推送、不回退到昨天，避免把旧日期当成今天发出去。
-    target = datetime.now()
-    try:
-        full_link, items = fetch_xwlb_items(target)
-    except Exception as e:
-        err = f"抓取今日({target:%Y-%m-%d})节目单异常: {e}"
-        log(f"[FATAL] {err}")
-        send_feishu_error(err)
-        sys.exit(1)
-
-    if not items:
-        log(f"今日({target:%Y-%m-%d})节目单尚未发布/暂无可解析条目, 暂不推送, 等待下次定时重试")
-        log("✅ 完成（等待节目单上线）")
-        return
+    # 只盯「今天」（北京时间），绝不回退到昨天：
+    # 新闻联播 19:00 播出，央视网当日节目单是「边播边传」的，
+    # 所以这里不是「有条目就推」，而是先等「联播播完」再推（见 wait_for_complete）。
+    # 这样做的好处：1. 联播一结束（整期视频上线 + 条目稳定 90s）就推，最快；
+    #              2. 即使联播超时到 19:50/20:00，也不会提前推半截（11-12 的漏稿事故）。
+    force = os.environ.get("FORCE_RUN", "").strip().lower() == "true"
+    target = beijing_now()
 
     date_cn = f"{target.year}年{target.month}月{target.day}日"
     rel_path = f"{target.year}年/{target.month}月/{target.day:02d}.html"
-    log(f"归档日期: {target:%Y-%m-%d}, {len(items)} 条, 路径: {rel_path}")
-
-    # 当日 HTML（幂等保护: 已归档则跳过, 避免备份时段重复生成/重复推送;
-    # 手动 workflow_dispatch 触发时 FORCE_RUN=true 可强制重跑）
     day_file = REPO_ROOT / rel_path
-    force = os.environ.get("FORCE_RUN", "").strip().lower() == "true"
-    if day_file.exists() and not force:
-        log(f"{rel_path} 已存在, 跳过重复归档与推送")
+
+    archived = None if force else read_archived_count(day_file)
+    if archived is not None:
+        log(f"{rel_path} 已归档（{archived} 条），本次只检查是否有新增条目")
+
+    full_link, items, reason, complete = wait_for_complete(target)
+
+    if not items:
+        log(f"今日({target:%Y-%m-%d}) {reason} —— 不归档、不推送, 等下一轮定时")
+        log("✅ 完成（无可用条目）")
+        return
+
+    log(f"归档日期: {target:%Y-%m-%d}, {len(items)} 条, 路径: {rel_path}")
+    log(f"完整性: {'齐全' if complete else '兜底'} —— {reason}")
+
+    # 幂等保护 + 自愈：
+    #   - 已归档且条目数 >= 现在抓到的 → 说明今天已经推全了，跳过（不重复发飞书）；
+    #   - 已归档但条目数变多 → 说明上次推的是「半截」（央视网后来又补了稿），
+    #     这次更新归档并补推一条带「（补全版）」标记的卡片，避免漏稿。
+    #   - 手动 workflow_dispatch 勾选 force → 无条件重跑重推。
+    if archived is not None and (archived < 0 or archived >= len(items)):
+        log(f"{rel_path} 已存在 {archived} 条, 无新增条目, 跳过归档与推送")
         log("✅ 完成（幂等跳过）")
         return
+
+    tag = ""
+    if archived is not None:
+        log(f"检测到补全: 归档 {archived} 条 → 现在 {len(items)} 条, 更新归档并补推")
+        tag = "（补全版）"
+
     day_file.parent.mkdir(parents=True, exist_ok=True)
     day_file.write_text(render_day_html(target, full_link, items), encoding="utf-8")
 
@@ -350,7 +458,7 @@ def main():
 
     # 飞书
     try:
-        send_feishu(target, items, full_link)
+        send_feishu(target, items, full_link, tag=tag)
     except Exception as e:
         log(f"【飞书推送】失败: {e}")
 
